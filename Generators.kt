@@ -1,31 +1,142 @@
-import controller.UploaderController
 import java.lang.StringBuilder
 import java.net.URL
 import java.util.*
 
-data class API(
-    val endpoint: String,
-    val description: String,
-    val arguments: List<Argument>,
-    val response: Response,
-    val failure: Boolean
-) {
-    data class Argument(var name: String, val type: String, val description: String, val required: Boolean) {
-        override fun equals(other: Any?): Boolean {
-            if (this === other) return true
-            if (other is Argument) {
-                return this.name == other.name
-            }
-
-            return false
+data class APIArgument(var name: String, val docsType: String, val description: String, val required: Boolean) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other is APIArgument) {
+            return this.name == other.name
         }
 
-        override fun hashCode(): Int {
-            return name.hashCode()
-        }
+        return false
     }
 
-    data class Response(val description: String, val example: String)
+    val kotlinType: String
+        get() {
+            return when (docsType) {
+                "<string>", "string" -> "String"
+                "<bool>", "bool" -> "Boolean"
+                "<uint64>", "int64" -> "Long"
+                "<int>", "int" -> "Int"
+                "array" -> "Array<*>"
+                else -> throw RuntimeException("not support type:$docsType")
+            }
+        }
+
+    override fun hashCode(): Int {
+        return name.hashCode()
+    }
+
+    fun toKotlinSignatureString(suffix: String?): String {
+        return "@Query(\"${this.name}\") ${this.name}$suffix:${this.kotlinType}"
+    }
+
+    fun toKotlinDocsString(suffix: String?): String {
+        return "* @param ${this.name}$suffix ${this.description}"
+    }
+}
+
+data class APIResponseType(val name: String, val type: String) {
+    companion object {
+        val TYPE_STRING = APIResponseType("<string>", "String")
+        val TYPE_BOOLEAN = APIResponseType("<bool>", "Boolean")
+        val TYPE_INT = APIResponseType("<int>", "Int")
+        val TYPE_UINT64 = APIResponseType("<uint64>", "Long")
+
+        val TYPE_VOID = APIResponseType("<void>", "void")
+    }
+
+    fun genCode(): String {
+        val t = when (this.type) {
+            "<string>" -> "String"
+            "<bool>" -> "Boolean"
+            "<uint64>" -> "Long"
+            "<int>" -> "Int"
+            else -> throw RuntimeException("not support type:${this.type}")
+        }
+
+        return "${this.name}:$t"
+    }
+}
+
+data class APIResponse(val description: String, val example: String) {
+    fun toKotlinDocsString(): String {
+        val builder = StringBuilder()
+        builder.append("* @return ${this.description}<br><pre>\n")
+        builder.append(this.example.lines().joinToString("\n") { "* $it" })
+            .append("</pre>")
+        return builder.toString()
+    }
+
+    val returnType: String
+        get() {
+            return if (this.example.contains("`text/plain`")) {
+                "ResponseBody"
+            } else {
+                "JSONObject"
+            }
+        }
+
+    private fun convertDocsType2KotlinType(type: String): String {
+        return when (type) {
+            "<int>" -> "Int"
+            "<uint64>" -> "Long"
+            "<string>" -> "String"
+            "<bool>" -> "Boolean"
+            else -> throw RuntimeException("unsupported docs type $type")
+        }
+    }
+}
+
+data class FinalAPI(
+    val endpoint: String,
+    val description: String,
+    val arguments: List<APIArgument>,
+    val response: APIResponse,
+    val failure: Boolean
+) {
+    private val LF = '\n'
+
+    private val mSignatureName: String by lazy {
+        val builder = StringBuilder()
+        this.endpoint.split('/')
+            .forEachIndexed { index, s ->
+                val name = s.replace("-", "_")
+                if (index == 3) {
+                    builder.append(name)
+                } else if (index > 3) {
+                    builder.append(name.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() })
+                }
+            }
+
+        builder.toString()
+    }
+
+    val signatureName: String
+        get() = this.mSignatureName
+
+    override fun toString(): String {
+        val builder = StringBuilder()
+        builder.append("/**").append(LF)
+            .append("* ").append(this.description).append(LF)
+
+        builder.append(this.arguments.mapIndexed { idx, arg -> arg.toKotlinDocsString("$idx") }.joinToString("\n"))
+            .append(LF)
+
+
+        builder.append(this.response.toKotlinDocsString()).append("*/").append(LF)
+
+        // source code
+        builder.append("@POST(\"${this.endpoint}\")").append(LF)
+        builder.append("suspend fun ").append(this.signatureName).append('(')
+        builder.append(this.arguments.mapIndexed { idx, arg -> arg.toKotlinSignatureString("$idx") }.joinToString(","))
+        builder.append(')')
+            .append(':')
+            .append(this.response.returnType)
+
+        return builder.toString()
+    }
 }
 
 object Generators {
@@ -50,9 +161,8 @@ object Generators {
         }
     }
 
-    private fun processEachAPI(md: Scanner, name: String): API {
-        val arguments = mutableListOf<API.Argument>()
-
+    private fun processEachAPI(md: Scanner, endpoint: String): FinalAPI {
+        val arguments = mutableListOf<APIArgument>()
         var description = ""
         var failure = false
         val response = StringBuilder()
@@ -72,7 +182,7 @@ object Generators {
             when (flag) {
                 FLAG_ARGUMENTS -> {
                     regexArguments.find(line)?.let {
-                        API.Argument(
+                        APIArgument(
                             it.groupValues[1],
                             it.groupValues[2],
                             it.groupValues[3],
@@ -91,99 +201,21 @@ object Generators {
                     val str = response.toString().replace("### Response", "")
                     val responseBody = regexResponse.find(str)!!.groupValues[1]
                     val responseDescription = str.replace(regexResponse, "").trim()
+                        .replace("\r|\n".toRegex(), "")
 
-                    return API(
-                        name, description, arguments,
-                        API.Response(
-                            responseDescription.replace("\r|\n".toRegex(), ""),
-                            responseBody
-                        ), failure
-                    )
+                    return APIResponse(
+                        responseDescription,
+                        responseBody
+                    ).let { FinalAPI(endpoint, description, arguments, it, failure) }
                 }
             }
         }
 
-        throw RuntimeException("process api fails with $name")
-    }
-
-    private fun convertType(type: String): String {
-        return when (type) {
-            "string" -> "String"
-            "bool" -> "Boolean"
-            "int64" -> "Long"
-            "int" -> "Int"
-            "array" -> "Array<*>"
-            else -> throw RuntimeException("not support type:$type")
-        }
-    }
-
-    /**
-     * @param apis aaaa
-     * @return adsfdsa
-     */
-    private fun makeSuspendFun(apis: Set<API>): String {
-        val LF = '\n'
-        return apis.joinToString("\n") { api ->
-            val codeBuilder = StringBuilder()
-            val commentBuilder = StringBuilder()
-            // comment
-            commentBuilder.append("/**").append(LF)
-            commentBuilder.append("* ").append(api.description).append(LF)
-            // argument comment
-
-            codeBuilder.append("@POST(\"${api.endpoint}\")").append(LF)
-            codeBuilder.append("suspend fun ")
-
-            // name
-            api.endpoint.split('/')
-                .forEachIndexed { index, s ->
-                    val name = s.replace("-", "_")
-                    if (index == 3) {
-                        codeBuilder.append(name)
-                    } else if (index > 3) {
-                        codeBuilder.append(name.replaceFirstChar { if (it.isLowerCase()) it.titlecase(Locale.getDefault()) else it.toString() })
-                    }
-                }
-
-            // arguments
-            codeBuilder.append('(')
-            api.arguments.forEachIndexed { idx, argument ->
-                commentBuilder.append("* @param ")
-                    .append(argument.name).append(idx).append(' ')
-                    .append(argument.description)
-                    .append(LF)
-
-                codeBuilder.append("@Path(\"${argument.name}\")")
-                    // Avoid duplicate parameter names
-                    .append(argument.name).append(idx)
-                    .append(':')
-                    .append(convertType(argument.type))
-                    .append(',')
-            }
-            // remove last cahr ','
-            if (api.arguments.isNotEmpty()) {
-                codeBuilder.deleteAt(codeBuilder.length - 1)
-            }
-            codeBuilder.append(')')
-
-            // return type
-            codeBuilder.append(": JSONObject")
-
-            commentBuilder.append("* @return ")
-                .append(api.response.description).append(LF)
-                .append("* <br>Example Response:<pre>").append(LF)
-            api.response.example.split('\n').forEach { line ->
-                commentBuilder.append("* ").append(line).append(LF)
-            }
-            commentBuilder.append("* </pre>").append(LF)
-            commentBuilder.append("*/").append(LF)
-
-            "$commentBuilder\n$codeBuilder"
-        }
+        throw RuntimeException("process api fails with $endpoint")
     }
 
     fun generate(docs: String): String {
-        val apis = mutableSetOf<API>()
+        val apis = mutableSetOf<FinalAPI>()
         URL(docs).openStream()
             .use { input ->
                 val md = Scanner(input)
@@ -200,7 +232,7 @@ object Generators {
                 }
             }
 
-        return makeSuspendFun(apis)
+        return apis.joinToString("\n")
     }
 
     @JvmStatic
